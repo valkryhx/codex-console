@@ -59,12 +59,12 @@ class RegistrationResult:
         }
 
 class RegistrationEngine:
-    def __init__(self, email_service, proxy_url=None, callback_logger=None, task_uuid=None):
+    def __init__(self, email_service, proxy_url=None, callback_logger=None, task_uuid=None, headless=False):
         self.email_service = email_service
         self.proxy_url = proxy_url
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
-        self.browser_client = BrowserClient(proxy_url=proxy_url)
+        self.browser_client = BrowserClient(proxy_url=proxy_url, headless=headless)
         self.page = None
         self.email = None
         self.password = None

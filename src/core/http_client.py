@@ -33,9 +33,10 @@ class HTTPClientError(Exception):
     pass
 
 class BrowserClient:
-    def __init__(self, proxy_url: Optional[str] = None, config: Optional[RequestConfig] = None):
+    def __init__(self, proxy_url: Optional[str] = None, config: Optional[RequestConfig] = None, headless: bool = False):
         self.proxy_url = proxy_url.strip() if proxy_url else None
         self.config = config or RequestConfig()
+        self.headless = headless
         self.page: Optional[ChromiumPage] = None
         self._pid: Optional[int] = None
         self._user_data_path: Optional[str] = None
@@ -85,7 +86,7 @@ class BrowserClient:
         # Linux 环境指定 chromium 路径；Windows 由 DrissionPage 自动探测
         if sys.platform != 'win32' and os.path.exists('/usr/bin/chromium'):
             co.set_browser_path('/usr/bin/chromium')
-        co.headless(False)
+        co.headless(self.headless)
 
         # 3. 分配独立 Profile 目录（跨平台）
         import uuid
