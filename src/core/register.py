@@ -433,8 +433,9 @@ class RegistrationEngine:
                         _btn = self.page.ele('xpath=//button[@type="submit"]', timeout=2)
                         if _btn: _btn.click()
                         continue
-                    # 兜底：邮箱 OTP
-                    if self.page.ele('text=Check your inbox', timeout=1):
+                    # 兜底：邮箱 OTP（按 URL 或输入框检测，不依赖文字）
+                    _otp_inp = self.page.ele('xpath=//input[@autocomplete="one-time-code"]', timeout=1)
+                    if 'email-verification' in _cur or self.page.ele('text=Check your inbox', timeout=1) or _otp_inp:
                         _eid = self.email_info.get('service_id') if self.email_info else None
                         _otp = self.email_service.get_verification_code(
                             email=self.email, email_id=_eid, timeout=120, pattern=OTP_CODE_PATTERN
@@ -443,6 +444,8 @@ class RegistrationEngine:
                             self._smart_fill('xpath=//input[@autocomplete="one-time-code"]', _otp, click_first=True)
                             time.sleep(0.5)
                             self.page.actions.key_down('ENTER').key_up('ENTER')
+                        else:
+                            self._log('PKCE登录 OTP 未取到，等待下轮重试...', 'warning')
                         continue
                 if _cb_url and 'error=' not in _cb_url:
                     _token_info = _oauth_mgr.handle_callback(
