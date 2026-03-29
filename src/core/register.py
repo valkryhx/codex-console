@@ -17,13 +17,16 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 # 延迟导入数据库层以打破 Circular Import 循环依赖
+import urllib.parse as _urlparse
 from ..config.constants import (
     generate_random_user_info,
     OTP_CODE_PATTERN,
     DEFAULT_PASSWORD_LENGTH,
     PASSWORD_CHARSET,
+    OAUTH_CLIENT_ID, OAUTH_REDIRECT_URI, OAUTH_SCOPE,
 )
 from .http_client import BrowserClient
+from .openai.oauth import OAuthManager
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +35,14 @@ class RegistrationResult:
     success: bool
     email: str = ""
     password: str = ""
-    session_token: str = "" 
+    session_token: str = ""
     access_token: str = ""
+    refresh_token: str = ""
+    id_token: str = ""
+    expired: str = ""
     error_message: str = ""
     logs: list = field(default_factory=list)
-    metadata: dict = field(default_factory=dict) 
+    metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         """核心修复：提供给上游系统进行 JSON 序列化和 CPA 投递"""
@@ -46,6 +52,9 @@ class RegistrationResult:
             "password": self.password,
             "session_token": self.session_token,
             "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "id_token": self.id_token,
+            "expired": self.expired,
             "error_message": self.error_message,
             "logs": self.logs,
             "metadata": self.metadata
@@ -381,13 +390,47 @@ class RegistrationEngine:
                 full_session_token = "".join(token_parts)
                 extracted_metadata = {"method": "cookie_assembly_fallback"}
 
+            # --- 阶段 6.5: 静默 PKCE OAuth 补全 refresh_token/id_token ---
+            # 浏览器此时已持有 auth.openai.com 有效 session，用 prompt=none 静默换取全套 token
+            try:
+                _oauth_mgr = OAuthManager(proxy_url=self.proxy_url)
+                _oauth_start = _oauth_mgr.start_oauth()
+                # 将 prompt=login 替换为 prompt=none，让服务端直接用已有 session，无需任何 UI
+                _silent_url = _oauth_start.auth_url.replace('prompt=login', 'prompt=none')
+                self._log('静默 PKCE 授权启动...')
+                self.page.get(_silent_url)
+                _cb_url = ''
+                for _ in range(30):
+                    time.sleep(1)
+                    _cur = self.page.url
+                    if 'localhost' in _cur or '1455' in _cur:
+                        _cb_url = _cur
+                        self._log(f'捕获静默回调: {_cur[:120]}')
+                        break
+                if _cb_url:
+                    _token_info = _oauth_mgr.handle_callback(
+                        callback_url=_cb_url,
+                        expected_state=_oauth_start.state,
+                        code_verifier=_oauth_start.code_verifier,
+                    )
+                    result.refresh_token = _token_info.get('refresh_token', '')
+                    result.id_token = _token_info.get('id_token', '')
+                    result.expired = _token_info.get('expired', '')
+                    if _token_info.get('access_token'):
+                        result.access_token = _token_info['access_token']
+                    self._log(f"静默 PKCE 完成: refresh={'有' if result.refresh_token else '无'} id_token={'有' if result.id_token else '无'}")
+                else:
+                    self._log('静默 PKCE 未收到回调，跳过（不影响主流程）', 'warning')
+            except Exception as _e:
+                self._log(f'静默 PKCE 异常（不影响主流程）: {_e}', 'warning')
+
             # --- 阶段 7: 数据固化返回 ---
             if full_session_token:
                 result.success = True
                 result.email = self.email
                 result.password = self.password
                 result.session_token = full_session_token
-                result.access_token = access_token
+                result.access_token = result.access_token or access_token
                 result.metadata = extracted_metadata
                 self._log("任务节点通过，全链路数据注入完毕。")
             else:
@@ -418,15 +461,17 @@ class RegistrationEngine:
             account_id = result.metadata.get("user_id") if result.metadata else None
 
             crud.create_account(
-                db=db, 
-                email=result.email, 
+                db=db,
+                email=result.email,
                 email_service=email_svc or 'unknown',
-                password=result.password, 
-                session_token=result.session_token, 
+                password=result.password,
+                session_token=result.session_token,
                 access_token=result.access_token,
+                refresh_token=result.refresh_token,
+                id_token=result.id_token,
                 account_id=account_id,
                 extra_data=result.metadata,
                 proxy_used=self.proxy_url,
-                **kwargs # 将上游路由框架传入的所有多余参数（如 account_label）透传
+                **kwargs
             )
             return True
