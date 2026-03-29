@@ -1,84 +1,33 @@
-import base64
-import json
+"""
+新版注册引擎测试 — 适配 DrissionPage BrowserClient FSM 架构
+"""
 
-from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
-from src.core.http_client import OpenAIHTTPClient
-from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine
+from unittest.mock import MagicMock, patch
+from dataclasses import fields
+
+from src.core.register import RegistrationEngine, RegistrationResult
+from src.core.http_client import BrowserClient, HTTPClient, OpenAIHTTPClient
 from src.services.base import BaseEmailService
+from src.config.constants import EmailServiceType
 
 
-class DummyResponse:
-    def __init__(self, status_code=200, payload=None, text="", headers=None, on_return=None):
-        self.status_code = status_code
-        self._payload = payload
-        self.text = text
-        self.headers = headers or {}
-        self.on_return = on_return
-
-    def json(self):
-        if self._payload is None:
-            raise ValueError("no json payload")
-        return self._payload
-
-
-class QueueSession:
-    def __init__(self, steps):
-        self.steps = list(steps)
-        self.calls = []
-        self.cookies = {}
-
-    def get(self, url, **kwargs):
-        return self._request("GET", url, **kwargs)
-
-    def post(self, url, **kwargs):
-        return self._request("POST", url, **kwargs)
-
-    def request(self, method, url, **kwargs):
-        return self._request(method.upper(), url, **kwargs)
-
-    def close(self):
-        return None
-
-    def _request(self, method, url, **kwargs):
-        self.calls.append({
-            "method": method,
-            "url": url,
-            "kwargs": kwargs,
-        })
-        if not self.steps:
-            raise AssertionError(f"unexpected request: {method} {url}")
-        expected_method, expected_url, response = self.steps.pop(0)
-        assert method == expected_method
-        assert url == expected_url
-        if callable(response):
-            response = response(self)
-        if response.on_return:
-            response.on_return(self)
-        return response
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 class FakeEmailService(BaseEmailService):
-    def __init__(self, codes):
+    def __init__(self, otp_code="123456", fail_create=False):
         super().__init__(EmailServiceType.TEMPMAIL)
-        self.codes = list(codes)
-        self.otp_requests = []
+        self.otp_code = otp_code
+        self.fail_create = fail_create
 
     def create_email(self, config=None):
-        return {
-            "email": "tester@example.com",
-            "service_id": "mailbox-1",
-        }
+        if self.fail_create:
+            raise RuntimeError("邮箱服务不可用")
+        return {"email": "tester@example.com", "service_id": "box-1"}
 
-    def get_verification_code(self, email, email_id=None, timeout=120, pattern=r"(?<!\d)(\d{6})(?!\d)", otp_sent_at=None):
-        self.otp_requests.append({
-            "email": email,
-            "email_id": email_id,
-            "otp_sent_at": otp_sent_at,
-        })
-        if not self.codes:
-            raise AssertionError("no verification code queued")
-        return self.codes.pop(0)
+    def get_verification_code(self, email, email_id=None, timeout=120, pattern=None):
+        return self.otp_code
 
     def list_emails(self, **kwargs):
         return []
@@ -90,207 +39,134 @@ class FakeEmailService(BaseEmailService):
         return True
 
 
-class FakeOAuthManager:
-    def __init__(self):
-        self.start_calls = 0
-        self.callback_calls = []
+# ---------------------------------------------------------------------------
+# RegistrationResult 单元测试
+# ---------------------------------------------------------------------------
 
-    def start_oauth(self):
-        self.start_calls += 1
-        return OAuthStart(
-            auth_url=f"https://auth.example.test/flow/{self.start_calls}",
-            state=f"state-{self.start_calls}",
-            code_verifier=f"verifier-{self.start_calls}",
-            redirect_uri="http://localhost:1455/auth/callback",
-        )
-
-    def handle_callback(self, callback_url, expected_state, code_verifier):
-        self.callback_calls.append({
-            "callback_url": callback_url,
-            "expected_state": expected_state,
-            "code_verifier": code_verifier,
-        })
-        return {
-            "account_id": "acct-1",
-            "access_token": "access-1",
-            "refresh_token": "refresh-1",
-            "id_token": "id-1",
-        }
+def test_registration_result_defaults():
+    """logs 和 metadata 默认为空容器而非 None"""
+    r = RegistrationResult(success=False)
+    assert isinstance(r.logs, list)
+    assert isinstance(r.metadata, dict)
 
 
-class FakeOpenAIClient:
-    def __init__(self, sessions, sentinel_tokens):
-        self._sessions = list(sessions)
-        self._session_index = 0
-        self._session = self._sessions[0]
-        self._sentinel_tokens = list(sentinel_tokens)
-
-    @property
-    def session(self):
-        return self._session
-
-    def check_ip_location(self):
-        return True, "US"
-
-    def check_sentinel(self, did):
-        if not self._sentinel_tokens:
-            raise AssertionError("no sentinel token queued")
-        return self._sentinel_tokens.pop(0)
-
-    def close(self):
-        if self._session_index + 1 < len(self._sessions):
-            self._session_index += 1
-            self._session = self._sessions[self._session_index]
-
-
-def _workspace_cookie(workspace_id):
-    payload = base64.urlsafe_b64encode(
-        json.dumps({"workspaces": [{"id": workspace_id}]}).encode("utf-8")
-    ).decode("ascii").rstrip("=")
-    return f"{payload}.sig"
-
-
-def _response_with_did(did):
-    return DummyResponse(
-        status_code=200,
-        text="ok",
-        on_return=lambda session: session.cookies.__setitem__("oai-did", did),
+def test_registration_result_to_dict_success():
+    """to_dict() 包含所有必要字段"""
+    r = RegistrationResult(
+        success=True,
+        email="a@b.com",
+        password="pass123",
+        session_token="sess-tok",
+        access_token="acc-tok",
     )
+    d = r.to_dict()
+    assert d["success"] is True
+    assert d["email"] == "a@b.com"
+    assert d["session_token"] == "sess-tok"
+    assert d["access_token"] == "acc-tok"
+    assert "logs" in d
+    assert "metadata" in d
 
 
-def _response_with_login_cookies(workspace_id="ws-1", session_token="session-1"):
-    def setter(session):
-        session.cookies["oai-client-auth-session"] = _workspace_cookie(workspace_id)
-        session.cookies["__Secure-next-auth.session-token"] = session_token
-
-    return DummyResponse(status_code=200, payload={}, on_return=setter)
-
-
-def test_check_sentinel_sends_non_empty_pow(monkeypatch):
-    session = QueueSession([
-        ("POST", OPENAI_API_ENDPOINTS["sentinel"], DummyResponse(payload={"token": "sentinel-token"})),
-    ])
-    client = OpenAIHTTPClient()
-    client._session = session
-
-    monkeypatch.setattr(
-        "src.core.http_client.build_sentinel_pow_token",
-        lambda user_agent: "gAAAAACpow-token",
-    )
-
-    token = client.check_sentinel("device-1")
-
-    assert token == "sentinel-token"
-    body = json.loads(session.calls[0]["kwargs"]["data"])
-    assert body["id"] == "device-1"
-    assert body["flow"] == "authorize_continue"
-    assert body["p"] == "gAAAAACpow-token"
+def test_registration_result_to_dict_failed():
+    """失败结果 to_dict() 仍正常序列化"""
+    r = RegistrationResult(success=False, error_message="timeout")
+    d = r.to_dict()
+    assert d["success"] is False
+    assert d["error_message"] == "timeout"
 
 
-def test_run_registers_then_relogs_to_fetch_token():
-    session_one = QueueSession([
-        ("GET", "https://auth.example.test/flow/1", _response_with_did("did-1")),
-        (
-            "POST",
-            OPENAI_API_ENDPOINTS["signup"],
-            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["PASSWORD_REGISTRATION"]}}),
-        ),
-        ("POST", OPENAI_API_ENDPOINTS["register"], DummyResponse(payload={})),
-        ("GET", OPENAI_API_ENDPOINTS["send_otp"], DummyResponse(payload={})),
-        ("POST", OPENAI_API_ENDPOINTS["validate_otp"], DummyResponse(payload={})),
-        ("POST", OPENAI_API_ENDPOINTS["create_account"], DummyResponse(payload={})),
-    ])
-    session_two = QueueSession([
-        ("GET", "https://auth.example.test/flow/2", _response_with_did("did-2")),
-        (
-            "POST",
-            OPENAI_API_ENDPOINTS["signup"],
-            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]}}),
-        ),
-        (
-            "POST",
-            OPENAI_API_ENDPOINTS["password_verify"],
-            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]}}),
-        ),
-        ("POST", OPENAI_API_ENDPOINTS["validate_otp"], _response_with_login_cookies()),
-        (
-            "POST",
-            OPENAI_API_ENDPOINTS["select_workspace"],
-            DummyResponse(payload={"continue_url": "https://auth.example.test/continue"}),
-        ),
-        (
-            "GET",
-            "https://auth.example.test/continue",
-            DummyResponse(
-                status_code=302,
-                headers={"Location": "http://localhost:1455/auth/callback?code=code-2&state=state-2"},
-            ),
-        ),
-    ])
+# ---------------------------------------------------------------------------
+# BrowserClient 别名兼容测试
+# ---------------------------------------------------------------------------
 
-    email_service = FakeEmailService(["123456", "654321"])
-    engine = RegistrationEngine(email_service)
-    fake_oauth = FakeOAuthManager()
-    engine.http_client = FakeOpenAIClient([session_one, session_two], ["sentinel-1", "sentinel-2"])
-    engine.oauth_manager = fake_oauth
+def test_http_client_aliases():
+    """HTTPClient 和 OpenAIHTTPClient 是 BrowserClient 的别名"""
+    assert HTTPClient is BrowserClient
+    assert OpenAIHTTPClient is BrowserClient
+
+
+def test_browser_client_init_no_proxy():
+    """无代理时正常初始化，api_session 就绪"""
+    client = BrowserClient()
+    assert client.proxy_url is None
+    assert client.api_session is not None
+    client.api_session.close()
+
+
+def test_browser_client_init_with_proxy():
+    """代理 URL 被正确存储"""
+    client = BrowserClient(proxy_url="http://127.0.0.1:7890")
+    assert client.proxy_url == "http://127.0.0.1:7890"
+    client.api_session.close()
+
+
+# ---------------------------------------------------------------------------
+# RegistrationEngine 初始化测试
+# ---------------------------------------------------------------------------
+
+def test_engine_init():
+    """RegistrationEngine 正确绑定 email_service 和 BrowserClient"""
+    svc = FakeEmailService()
+    engine = RegistrationEngine(svc)
+    assert engine.email_service is svc
+    assert isinstance(engine.browser_client, BrowserClient)
+    assert engine.logs == []
+
+
+# ---------------------------------------------------------------------------
+# run() 异常路径测试
+# ---------------------------------------------------------------------------
+
+def test_run_returns_failure_when_browser_init_raises():
+    """浏览器初始化失败时，run() 返回 success=False 且含 error_message"""
+    svc = FakeEmailService()
+    engine = RegistrationEngine(svc)
+    engine.browser_client = MagicMock()
+    engine.browser_client.init_browser.side_effect = RuntimeError("浏览器启动失败")
+    engine.browser_client.close = MagicMock()
 
     result = engine.run()
 
-    assert result.success is True
-    assert result.source == "register"
-    assert result.workspace_id == "ws-1"
-    assert result.session_token == "session-1"
-    assert fake_oauth.start_calls == 2
-    assert len(email_service.otp_requests) == 2
-    assert all(item["otp_sent_at"] is not None for item in email_service.otp_requests)
-    assert sum(1 for call in session_one.calls if call["url"] == OPENAI_API_ENDPOINTS["send_otp"]) == 1
-    assert sum(1 for call in session_two.calls if call["url"] == OPENAI_API_ENDPOINTS["send_otp"]) == 0
-    assert sum(1 for call in session_one.calls if call["url"] == OPENAI_API_ENDPOINTS["select_workspace"]) == 0
-    assert sum(1 for call in session_two.calls if call["url"] == OPENAI_API_ENDPOINTS["select_workspace"]) == 1
-    relogin_start_body = json.loads(session_two.calls[1]["kwargs"]["data"])
-    assert relogin_start_body["screen_hint"] == "login"
-    assert relogin_start_body["username"]["value"] == "tester@example.com"
-    password_verify_body = json.loads(session_two.calls[2]["kwargs"]["data"])
-    assert password_verify_body == {"password": result.password}
-    assert result.metadata["token_acquired_via_relogin"] is True
+    assert result.success is False
+    assert "浏览器启动失败" in result.error_message
 
 
-def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
-    session = QueueSession([
-        ("GET", "https://auth.example.test/flow/1", _response_with_did("did-1")),
-        (
-            "POST",
-            OPENAI_API_ENDPOINTS["signup"],
-            DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]}}),
-        ),
-        ("POST", OPENAI_API_ENDPOINTS["validate_otp"], _response_with_login_cookies("ws-existing", "session-existing")),
-        (
-            "POST",
-            OPENAI_API_ENDPOINTS["select_workspace"],
-            DummyResponse(payload={"continue_url": "https://auth.example.test/continue-existing"}),
-        ),
-        (
-            "GET",
-            "https://auth.example.test/continue-existing",
-            DummyResponse(
-                status_code=302,
-                headers={"Location": "http://localhost:1455/auth/callback?code=code-1&state=state-1"},
-            ),
-        ),
-    ])
-
-    email_service = FakeEmailService(["246810"])
-    engine = RegistrationEngine(email_service)
-    fake_oauth = FakeOAuthManager()
-    engine.http_client = FakeOpenAIClient([session], ["sentinel-1"])
-    engine.oauth_manager = fake_oauth
+def test_run_returns_failure_when_email_creation_raises():
+    """邮箱服务异常时，run() 捕获并返回失败"""
+    svc = FakeEmailService(fail_create=True)
+    engine = RegistrationEngine(svc)
+    engine.browser_client = MagicMock()
+    engine.browser_client.init_browser.side_effect = Exception("不应被调用")
+    engine.browser_client.close = MagicMock()
 
     result = engine.run()
 
-    assert result.success is True
-    assert result.source == "login"
-    assert fake_oauth.start_calls == 1
-    assert sum(1 for call in session.calls if call["url"] == OPENAI_API_ENDPOINTS["send_otp"]) == 0
-    assert len(email_service.otp_requests) == 1
-    assert email_service.otp_requests[0]["otp_sent_at"] is not None
-    assert result.metadata["token_acquired_via_relogin"] is False
+    assert result.success is False
+    # 邮箱创建抛出异常后，错误被捕获
+    assert result.error_message != ""
+
+
+def test_run_logs_are_populated_on_failure():
+    """失败时 logs 列表有内容"""
+    svc = FakeEmailService()
+    engine = RegistrationEngine(svc)
+    engine.browser_client = MagicMock()
+    engine.browser_client.init_browser.side_effect = RuntimeError("崩溃")
+    engine.browser_client.close = MagicMock()
+
+    result = engine.run()
+
+    assert len(result.logs) > 0
+
+
+# ---------------------------------------------------------------------------
+# save_to_database 测试
+# ---------------------------------------------------------------------------
+
+def test_save_to_database_skips_failed_result():
+    """失败结果不写入数据库，直接返回 False"""
+    svc = FakeEmailService()
+    engine = RegistrationEngine(svc)
+    result = RegistrationResult(success=False)
+    assert engine.save_to_database(result) is False
