@@ -400,13 +400,23 @@ class RegistrationEngine:
                 self._log('PKCE OAuth 登录补全启动...')
                 self.page.get(_login_url)
                 _cb_url = ''
-                for _r in range(15):
+                for _r in range(20):
                     time.sleep(3)
                     _cur = self.page.url
+                    self._log(f'PKCE登录第{_r+1}轮 | {_cur[:80]}')
                     if 'localhost' in _cur or '1455' in _cur:
                         _cb_url = _cur
                         self._log(f'PKCE 回调捕获: {_cur[:120]}')
                         break
+                    # 优先：密码直通车（跳过 OTP）
+                    _pwd_bypass = self.page.ele('text=Continue with password', timeout=1)
+                    if _pwd_bypass and _pwd_bypass.wait.displayed(timeout=1):
+                        self._log('PKCE登录：密码直通车击破 OTP')
+                        try:
+                            _pwd_bypass.click()
+                        except:
+                            self.page.run_js('arguments[0].click();', _pwd_bypass)
+                        continue
                     # 填邮箱
                     _ei = self.page.ele('xpath=//input[@type="email"]', timeout=1)
                     if _ei and _ei.wait.displayed(timeout=1):
@@ -423,7 +433,7 @@ class RegistrationEngine:
                         _btn = self.page.ele('xpath=//button[@type="submit"]', timeout=2)
                         if _btn: _btn.click()
                         continue
-                    # 处理邮箱 OTP（登录时可能触发）
+                    # 兜底：邮箱 OTP
                     if self.page.ele('text=Check your inbox', timeout=1):
                         _eid = self.email_info.get('service_id') if self.email_info else None
                         _otp = self.email_service.get_verification_code(
