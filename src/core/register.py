@@ -23,10 +23,8 @@ from ..config.constants import (
     OTP_CODE_PATTERN,
     DEFAULT_PASSWORD_LENGTH,
     PASSWORD_CHARSET,
-    OAUTH_CLIENT_ID, OAUTH_REDIRECT_URI, OAUTH_SCOPE,
 )
 from .http_client import BrowserClient
-from .openai.oauth import OAuthManager
 
 logger = logging.getLogger(__name__)
 
@@ -390,79 +388,6 @@ class RegistrationEngine:
                 full_session_token = "".join(token_parts)
                 extracted_metadata = {"method": "cookie_assembly_fallback"}
 
-            # --- 阶段 6.5: PKCE OAuth 登录补全 refresh_token/id_token ---
-            # 注册完成后用已有邮箱+密码走一次 OAuth 登录，换取全套 codex token
-            try:
-                _oauth_mgr = OAuthManager(proxy_url=self.proxy_url)
-                _oauth_start = _oauth_mgr.start_oauth()
-                # 去掉 prompt=login，让服务端用默认行为；不加 screen_hint=signup
-                _login_url = _oauth_start.auth_url.replace('&prompt=login', '')
-                self._log('PKCE OAuth 登录补全启动...')
-                self.page.get(_login_url)
-                _cb_url = ''
-                for _r in range(20):
-                    time.sleep(3)
-                    _cur = self.page.url
-                    self._log(f'PKCE登录第{_r+1}轮 | {_cur[:80]}')
-                    if 'localhost' in _cur or '1455' in _cur:
-                        _cb_url = _cur
-                        self._log(f'PKCE 回调捕获: {_cur[:120]}')
-                        break
-                    # 优先：密码直通车（跳过 OTP）
-                    _pwd_bypass = self.page.ele('text=Continue with password', timeout=1)
-                    if _pwd_bypass and _pwd_bypass.wait.displayed(timeout=1):
-                        self._log('PKCE登录：密码直通车击破 OTP')
-                        try:
-                            _pwd_bypass.click()
-                        except:
-                            self.page.run_js('arguments[0].click();', _pwd_bypass)
-                        continue
-                    # 填邮箱
-                    _ei = self.page.ele('xpath=//input[@type="email"]', timeout=1)
-                    if _ei and _ei.wait.displayed(timeout=1):
-                        _ei.input(self.email)
-                        time.sleep(0.5)
-                        _btn = self.page.ele('xpath=//button[@type="submit"]', timeout=2)
-                        if _btn: _btn.click()
-                        continue
-                    # 填密码
-                    _pi = self.page.ele('xpath=//input[@type="password"]', timeout=1)
-                    if _pi and _pi.wait.displayed(timeout=1):
-                        self._smart_fill('xpath=//input[@type="password"]', self.password, click_first=True)
-                        time.sleep(1)
-                        _btn = self.page.ele('xpath=//button[@type="submit"]', timeout=2)
-                        if _btn: _btn.click()
-                        continue
-                    # 兜底：邮箱 OTP（按 URL 或输入框检测，不依赖文字）
-                    _otp_inp = self.page.ele('xpath=//input[@autocomplete="one-time-code"]', timeout=1)
-                    if 'email-verification' in _cur or self.page.ele('text=Check your inbox', timeout=1) or _otp_inp:
-                        _eid = self.email_info.get('service_id') if self.email_info else None
-                        _otp = self.email_service.get_verification_code(
-                            email=self.email, email_id=_eid, timeout=120, pattern=OTP_CODE_PATTERN
-                        )
-                        if _otp:
-                            self._smart_fill('xpath=//input[@autocomplete="one-time-code"]', _otp, click_first=True)
-                            time.sleep(0.5)
-                            self.page.actions.key_down('ENTER').key_up('ENTER')
-                        else:
-                            self._log('PKCE登录 OTP 未取到，等待下轮重试...', 'warning')
-                        continue
-                if _cb_url and 'error=' not in _cb_url:
-                    _token_info = _oauth_mgr.handle_callback(
-                        callback_url=_cb_url,
-                        expected_state=_oauth_start.state,
-                        code_verifier=_oauth_start.code_verifier,
-                    )
-                    result.refresh_token = _token_info.get('refresh_token', '')
-                    result.id_token = _token_info.get('id_token', '')
-                    result.expired = _token_info.get('expired', '')
-                    if _token_info.get('access_token'):
-                        result.access_token = _token_info['access_token']
-                    self._log(f"PKCE 补全完成: refresh={'有' if result.refresh_token else '无'} id_token={'有' if result.id_token else '无'}")
-                else:
-                    self._log(f'PKCE 登录补全未拿到有效回调: {_cb_url[:80] if _cb_url else "超时"}', 'warning')
-            except Exception as _e:
-                self._log(f'PKCE 登录补全异常（不影响主流程）: {_e}', 'warning')
 
             # --- 阶段 7: 数据固化返回 ---
             if full_session_token:
