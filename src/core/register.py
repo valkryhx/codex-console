@@ -390,24 +390,51 @@ class RegistrationEngine:
                 full_session_token = "".join(token_parts)
                 extracted_metadata = {"method": "cookie_assembly_fallback"}
 
-            # --- 阶段 6.5: 静默 PKCE OAuth 补全 refresh_token/id_token ---
-            # 浏览器此时已持有 auth.openai.com 有效 session，用 prompt=none 静默换取全套 token
+            # --- 阶段 6.5: PKCE OAuth 登录补全 refresh_token/id_token ---
+            # 注册完成后用已有邮箱+密码走一次 OAuth 登录，换取全套 codex token
             try:
                 _oauth_mgr = OAuthManager(proxy_url=self.proxy_url)
                 _oauth_start = _oauth_mgr.start_oauth()
-                # 将 prompt=login 替换为 prompt=none，让服务端直接用已有 session，无需任何 UI
-                _silent_url = _oauth_start.auth_url.replace('prompt=login', 'prompt=none')
-                self._log('静默 PKCE 授权启动...')
-                self.page.get(_silent_url)
+                # 去掉 prompt=login，让服务端用默认行为；不加 screen_hint=signup
+                _login_url = _oauth_start.auth_url.replace('&prompt=login', '')
+                self._log('PKCE OAuth 登录补全启动...')
+                self.page.get(_login_url)
                 _cb_url = ''
-                for _ in range(30):
-                    time.sleep(1)
+                for _r in range(15):
+                    time.sleep(3)
                     _cur = self.page.url
                     if 'localhost' in _cur or '1455' in _cur:
                         _cb_url = _cur
-                        self._log(f'捕获静默回调: {_cur[:120]}')
+                        self._log(f'PKCE 回调捕获: {_cur[:120]}')
                         break
-                if _cb_url:
+                    # 填邮箱
+                    _ei = self.page.ele('xpath=//input[@type="email"]', timeout=1)
+                    if _ei and _ei.wait.displayed(timeout=1):
+                        _ei.input(self.email)
+                        time.sleep(0.5)
+                        _btn = self.page.ele('xpath=//button[@type="submit"]', timeout=2)
+                        if _btn: _btn.click()
+                        continue
+                    # 填密码
+                    _pi = self.page.ele('xpath=//input[@type="password"]', timeout=1)
+                    if _pi and _pi.wait.displayed(timeout=1):
+                        self._smart_fill('xpath=//input[@type="password"]', self.password, click_first=True)
+                        time.sleep(1)
+                        _btn = self.page.ele('xpath=//button[@type="submit"]', timeout=2)
+                        if _btn: _btn.click()
+                        continue
+                    # 处理邮箱 OTP（登录时可能触发）
+                    if self.page.ele('text=Check your inbox', timeout=1):
+                        _eid = self.email_info.get('service_id') if self.email_info else None
+                        _otp = self.email_service.get_verification_code(
+                            email=self.email, email_id=_eid, timeout=120, pattern=OTP_CODE_PATTERN
+                        )
+                        if _otp:
+                            self._smart_fill('xpath=//input[@autocomplete="one-time-code"]', _otp, click_first=True)
+                            time.sleep(0.5)
+                            self.page.actions.key_down('ENTER').key_up('ENTER')
+                        continue
+                if _cb_url and 'error=' not in _cb_url:
                     _token_info = _oauth_mgr.handle_callback(
                         callback_url=_cb_url,
                         expected_state=_oauth_start.state,
@@ -418,11 +445,11 @@ class RegistrationEngine:
                     result.expired = _token_info.get('expired', '')
                     if _token_info.get('access_token'):
                         result.access_token = _token_info['access_token']
-                    self._log(f"静默 PKCE 完成: refresh={'有' if result.refresh_token else '无'} id_token={'有' if result.id_token else '无'}")
+                    self._log(f"PKCE 补全完成: refresh={'有' if result.refresh_token else '无'} id_token={'有' if result.id_token else '无'}")
                 else:
-                    self._log('静默 PKCE 未收到回调，跳过（不影响主流程）', 'warning')
+                    self._log(f'PKCE 登录补全未拿到有效回调: {_cb_url[:80] if _cb_url else "超时"}', 'warning')
             except Exception as _e:
-                self._log(f'静默 PKCE 异常（不影响主流程）: {_e}', 'warning')
+                self._log(f'PKCE 登录补全异常（不影响主流程）: {_e}', 'warning')
 
             # --- 阶段 7: 数据固化返回 ---
             if full_session_token:
